@@ -2,6 +2,7 @@ package main
 
 import (
 	"App-Client-Code/constants"
+	"App-Client-Code/eventEmitter"
 	"fmt"
 	"log"
 	"strings"
@@ -9,10 +10,11 @@ import (
 )
 
 const (
-	HANDSHAKE = 0
-	FRAME     = 1
-	CLOSE     = 2
-	HELLO     = 3
+	// Opcodes
+	HANDSHAKE = iota
+	FRAME
+	CLOSE
+	HELLO
 )
 
 var (
@@ -50,12 +52,20 @@ type DiscordSdk struct {
 	configuration Configuration
 	source        js.Value
 	sourceOrigin  string
+	EventBus      *eventEmitter.EventEmitter
+}
+
+func (sdk *DiscordSdk) String() string {
+	return fmt.Sprintf("DiscordSdk{channelId: %s, clientId: %s, frameId: %s, guildId: %s, instanceId: %s, platform: %s, ready: %t, configuration: %v, source: %v, sourceOrigin: %s}",
+		sdk.channelId, sdk.clientId, sdk.frameId, sdk.guildId, sdk.instanceId, sdk.platform, sdk.ready, sdk.configuration, sdk.source, sdk.sourceOrigin)
+
 }
 
 func NewDiscordSdk(clientId string, config Configuration) DiscordSdk {
 	tempSdk := DiscordSdk{}
 
 	// setup the eventBus
+	tempSdk.EventBus = eventEmitter.NewEventEmitter()
 
 	// set source and sourceOrigin to default values
 	tempSdk.source = js.Null()
@@ -82,7 +92,6 @@ func NewDiscordSdk(clientId string, config Configuration) DiscordSdk {
 		tempSdk.channelId = ""
 		return tempSdk
 	}
-
 	// get all the iframe parameters
 	tempSdk.frameId = GetParam("frame_id")
 	if tempSdk.frameId == "" {
@@ -109,7 +118,6 @@ func NewDiscordSdk(clientId string, config Configuration) DiscordSdk {
 	tempSdk.source, tempSdk.sourceOrigin = tempSdk.getRPCServerSource()
 	tempSdk.addOnReadyListener()
 	tempSdk.handshake()
-
 	return tempSdk
 }
 
@@ -148,7 +156,6 @@ func (sdk *DiscordSdk) handshake() {
 			"frame_id":  sdk.frameId,
 		}}, sdk.sourceOrigin,
 	)
-	fmt.Println("Handshake sent")
 }
 
 func (sdk *DiscordSdk) onMessage(event js.Value) {
@@ -159,6 +166,10 @@ func (sdk *DiscordSdk) onMessage(event js.Value) {
 	ev := event.Get("data")
 	// check if the event is an array
 	if ev.Type() != js.TypeObject {
+		return
+	}
+	// check any of the opcode or data is undefined or null
+	if ev.Index(0).IsUndefined() || ev.Index(0).IsNull() || ev.Index(1).IsUndefined() || ev.Index(1).IsNull() {
 		return
 	}
 	opcode, data := ev.Index(0).Int(), ev.Index(1)
@@ -188,9 +199,69 @@ func (sdk *DiscordSdk) handleHandshake() {}
 
 func (sdk *DiscordSdk) handleFrame(payload js.Value) {
 	fmt.Println("Handle Frame")
+	incomingPayload := parseIncomingPayload(payload)
+	// check if the payload cmd is a dispatch
+	if incomingPayload.Evt != constants.DISPATCH {
+		// dispatch the event and the data in the event bus
+	}
 }
 
-func contains(arr []string, str string) bool {
+type IncomingPayload struct {
+	Evt   string   `json:"evt"`
+	Nonce string   `json:"nonce"`
+	Data  js.Value `json:"data"`
+	Cmd   string   `json:"cmd"`
+}
+
+func parseIncomingPayload(payload js.Value) IncomingPayload {
+	fmt.Println("Parse Incoming Payload")
+	if !payload.Get("evt").IsNull() {
+		// check if the event is an error
+		if payload.Get("evt").String() == constants.ERROR {
+			log.Fatal("Error", payload.Get("data").String())
+		}
+		// if the event is not an error, parse the payload as an event Payload
+		return parseEventPayload(payload)
+	} else {
+		// if the event is null, parse the payload as a Response Payload
+		return parseResponsePayload(payload)
+	}
+}
+
+func parseEventPayload(payload js.Value) IncomingPayload {
+	evt := payload.Get("evt").String()
+	if !contains(constants.Events, evt) {
+		log.Fatal("Invalid event", evt)
+	}
+	nonce := payload.Get("nonce").String()
+	data := payload.Get("data")
+	cmd := payload.Get("cmd").String()
+	return IncomingPayload{
+		Evt:   evt,
+		Nonce: nonce,
+		Data:  data,
+		Cmd:   cmd,
+	}
+}
+
+func parseResponsePayload(payload js.Value) IncomingPayload {
+	nonce := payload.Get("nonce").String()
+	data := payload.Get("data")
+	cmd := payload.Get("cmd").String()
+	// check if it is a known command
+	if !contains(constants.Commands, cmd) {
+		log.Fatal("Unknown command", cmd)
+	}
+	return IncomingPayload{
+		Evt:   "",
+		Nonce: nonce,
+		Data:  data,
+		Cmd:   cmd,
+	}
+
+}
+
+func contains[c comparable](arr []c, str c) bool {
 	for _, a := range arr {
 		if a == str {
 			return true
@@ -229,6 +300,10 @@ func GetParam(key string) string {
 func main() {
 	sdk := NewDiscordSdk("1219594199188377651", Configuration{})
 	fmt.Println("Discord SDK", sdk)
+
+	// display a discord sdk information on the web page
+	//js.Global().Get("document").Call("write", fmt.Sprintf("<h1>%s</h1>", sdk.String()))
+
 	//prevent the program from exiting
 	select {}
 }
