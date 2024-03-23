@@ -3,7 +3,9 @@ package main
 import (
 	"App-Client-Code/constants"
 	"App-Client-Code/eventEmitter"
+	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"log"
 	"strings"
 	"syscall/js"
@@ -43,23 +45,31 @@ func GetDefaultConfiguration() Configuration {
 }
 
 type DiscordSdk struct {
-	channelId     string
-	clientId      string
-	frameId       string
-	guildId       string
-	instanceId    string
-	platform      string
-	ready         bool
-	configuration Configuration
-	source        js.Value
-	sourceOrigin  string
-	EventBus      *eventEmitter.EventEmitter
+	channelId       string
+	clientId        string
+	frameId         string
+	guildId         string
+	instanceId      string
+	platform        string
+	ready           bool
+	configuration   Configuration
+	source          js.Value
+	sourceOrigin    string
+	EventBus        *eventEmitter.EventEmitter
+	PendingCommands map[string]func(js.Value, error)
 }
 
 func (sdk *DiscordSdk) String() string {
 	return fmt.Sprintf("DiscordSdk{channelId: %s, clientId: %s, frameId: %s, guildId: %s, instanceId: %s, platform: %s, ready: %t, configuration: %v, source: %v, sourceOrigin: %s}",
 		sdk.channelId, sdk.clientId, sdk.frameId, sdk.guildId, sdk.instanceId, sdk.platform, sdk.ready, sdk.configuration, sdk.source, sdk.sourceOrigin)
 
+}
+
+func defaultErrorHandler(msg js.Value, err error) {
+	if err != nil {
+		// call console.error
+		js.Global().Get("console").Call("error", msg.Get("message").String())
+	}
 }
 
 func NewDiscordSdk(clientId string, config Configuration) *DiscordSdk {
@@ -71,6 +81,7 @@ func NewDiscordSdk(clientId string, config Configuration) *DiscordSdk {
 	// set source and sourceOrigin to default values
 	tempSdk.source = js.Null()
 	tempSdk.sourceOrigin = ""
+	tempSdk.PendingCommands = make(map[string]func(js.Value, error))
 
 	// setup the pendingCommandMap
 
@@ -122,6 +133,7 @@ func NewDiscordSdk(clientId string, config Configuration) *DiscordSdk {
 	return tempSdk
 }
 
+// GetRPCServerSource returns the source and the sourceOrigin of the RPC server
 func (sdk *DiscordSdk) getRPCServerSource() (js.Value, string) {
 	var a js.Value
 	parent := js.Global().Get("window").Get("parent")
@@ -136,6 +148,31 @@ func (sdk *DiscordSdk) getRPCServerSource() (js.Value, string) {
 		return a, referrer.String()
 	}
 	return a, "*"
+}
+
+// GetTransfer returns the transfer object from the payload
+func (sdk *DiscordSdk) getTransfer(payload js.Value) js.Value {
+	switch payload.Get("cmd").String() {
+	case constants.SUBSCRIBE, constants.UNSUBSCRIBE:
+		return js.Undefined()
+	default:
+		transfer := payload.Get("transfer")
+		if !transfer.IsNull() && !transfer.IsUndefined() {
+			return transfer
+		}
+		return js.Undefined()
+	}
+}
+
+// SendCommand sends a command to the Discord RPC server when the command is answered the callback function is called with the response and an non-nil error if there was an error
+func (sdk *DiscordSdk) SendCommand(payload map[string]interface{}, callback func(js.Value, error)) {
+	if sdk.source.IsNull() {
+		log.Fatal("Attempting to send message before initialization")
+	}
+	nonce := uuid.New().String()
+	payload["nonce"] = nonce
+	sdk.source.Call("postMessage", []interface{}{FRAME, payload}, sdk.sourceOrigin, js.Undefined())
+	sdk.PendingCommands[nonce] = callback
 }
 
 func (sdk *DiscordSdk) addOnReadyListener() {
@@ -209,6 +246,27 @@ func (sdk *DiscordSdk) handleClose(payload js.Value) {
 
 func (sdk *DiscordSdk) handleHandshake() {}
 
+func (sdk *DiscordSdk) Subscribe(event string, fn func(...interface{}), context interface{}, args ...interface{}) {
+	listenerCount := sdk.EventBus.ListenerCount(event)
+	sdk.EventBus.On(event, fn, context)
+	// if this is the first suscriber to the event, send the subscribe command to the RPC server
+	if listenerCount == 0 && event != constants.READY && contains(constants.Events, event) {
+		arguments := make([]interface{}, len(args))
+		payload := map[string]interface{}{
+			"cmd":  constants.SUBSCRIBE,
+			"args": arguments,
+			"evt":  event,
+		}
+		sdk.SendCommand(payload, func(msg js.Value, err error) { defaultErrorHandler(msg, err) })
+	}
+}
+
+type SDKError struct {
+	Code    int
+	Message string
+	Name    string
+}
+
 func (sdk *DiscordSdk) handleFrame(payload js.Value) {
 	fmt.Println("Handle Frame")
 	incomingPayload := parseIncomingPayload(payload)
@@ -217,6 +275,34 @@ func (sdk *DiscordSdk) handleFrame(payload js.Value) {
 		// dispatch the event and the data in the event bus
 		fmt.Println("Emitting", incomingPayload.Evt)
 		sdk.EventBus.Emit(incomingPayload.Evt, incomingPayload.Data)
+	} else {
+		if incomingPayload.Evt == constants.ERROR {
+			// in response to a command
+			if incomingPayload.Nonce != "" {
+				// check if the nonce is in the pendingCommands map
+				if _, ok := sdk.PendingCommands[incomingPayload.Nonce]; ok {
+					// call the callback function with the error
+					sdk.PendingCommands[incomingPayload.Nonce](incomingPayload.Data, errors.New("error"))
+					// remove the command from the pendingCommands map
+					delete(sdk.PendingCommands, incomingPayload.Nonce)
+				}
+				// general error
+				sdk.EventBus.Emit("error", SDKError{
+					Code:    incomingPayload.Data.Get("code").Int(),
+					Message: incomingPayload.Data.Get("message").String(),
+					Name:    "Discord SDK Error",
+				})
+			}
+		}
+	}
+	if incomingPayload.Nonce == "" {
+		log.Fatal("Missing nonce")
+	}
+	if _, ok := sdk.PendingCommands[incomingPayload.Nonce]; ok {
+		// call the callback function with the response
+		sdk.PendingCommands[incomingPayload.Nonce](incomingPayload.Data, nil)
+		// remove the command from the pendingCommands map
+		delete(sdk.PendingCommands, incomingPayload.Nonce)
 	}
 }
 
@@ -228,11 +314,10 @@ type IncomingPayload struct {
 }
 
 func parseIncomingPayload(payload js.Value) IncomingPayload {
-	fmt.Println("Parse Incoming Payload")
 	if !payload.Get("evt").IsNull() {
 		// check if the event is an error
 		if payload.Get("evt").String() == constants.ERROR {
-			log.Fatal("Error", payload.Get("data").String())
+			return parseErrorPayload(payload)
 		}
 		// if the event is not an error, parse the payload as an event Payload
 		return parseEventPayload(payload)
@@ -240,6 +325,19 @@ func parseIncomingPayload(payload js.Value) IncomingPayload {
 		// if the event is null, parse the payload as a Response Payload
 		return parseResponsePayload(payload)
 	}
+}
+
+func parseErrorPayload(payload js.Value) IncomingPayload {
+	nonce := payload.Get("nonce").String()
+	data := payload.Get("data")
+	cmd := payload.Get("cmd").String()
+	return IncomingPayload{
+		Evt:   constants.ERROR,
+		Nonce: nonce,
+		Data:  data,
+		Cmd:   cmd,
+	}
+
 }
 
 func parseEventPayload(payload js.Value) IncomingPayload {
@@ -318,8 +416,14 @@ func main() {
 	// display a discord sdk information on the web page
 	//js.Global().Get("document").Call("write", fmt.Sprintf("<h1>%s</h1>", sdk.String()))
 
-	go sdk.Ready(func(args ...interface{}) {
+	// wait for the SDK to be ready
+	sdk.Ready(func(args ...interface{}) {
 		fmt.Println("SDK is ready")
+	}, nil)
+
+	// subscribe to the VOICE_STATE_UPDATE event
+	sdk.Subscribe(constants.VOICE_STATE_UPDATE, func(args ...interface{}) {
+		fmt.Println("Voice State Update", args)
 	}, nil)
 
 	//prevent the program from exiting

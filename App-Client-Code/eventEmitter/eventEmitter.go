@@ -100,13 +100,13 @@ func (emitter *EventEmitter) RemoveAllListeners(event string) {
 }
 
 // ListenerCount returns the number of listeners
-func (emitter *EventEmitter) ListenerCount() int {
+func (emitter *EventEmitter) ListenerCount(event string) int {
 	emitter.events.mutex.RLock()
 	defer emitter.events.mutex.RUnlock()
 
-	count := 0
-	for _, listeners := range emitter.events.listeners {
-		count += len(listeners)
+	if event == "" {
+		return len(emitter.events.listeners)
 	}
-	return count
+
+	return len(emitter.events.listeners[event])
 }
