@@ -55,11 +55,15 @@ func (emitter *EventEmitter) Emit(event string, args ...interface{}) bool {
 	}
 
 	for _, listener := range listeners {
-		if listener.once {
-			emitter.RemoveListener(event, listener.fn)
-		}
-
+		// Call the listener function.
 		listener.fn(args...)
+		// If the listener is a one-time listener, remove it.
+		if listener.once {
+			// unlock the mutex to allow the listener to remove itself
+			emitter.events.mutex.RUnlock()
+			emitter.RemoveListener(event, listener.fn)
+			emitter.events.mutex.RLock()
+		}
 	}
 
 	return true
@@ -69,7 +73,6 @@ func (emitter *EventEmitter) Emit(event string, args ...interface{}) bool {
 func (emitter *EventEmitter) RemoveListener(event string, fn func(...interface{})) {
 	emitter.events.mutex.Lock()
 	defer emitter.events.mutex.Unlock()
-
 	listeners, ok := emitter.events.listeners[event]
 	if !ok {
 		return
@@ -81,7 +84,6 @@ func (emitter *EventEmitter) RemoveListener(event string, fn func(...interface{}
 			remainingListeners = append(remainingListeners, listener)
 		}
 	}
-
 	emitter.events.listeners[event] = remainingListeners
 }
 
@@ -95,4 +97,16 @@ func (emitter *EventEmitter) RemoveAllListeners(event string) {
 	} else {
 		emitter.events.listeners = make(map[string][]*EE)
 	}
+}
+
+// ListenerCount returns the number of listeners
+func (emitter *EventEmitter) ListenerCount() int {
+	emitter.events.mutex.RLock()
+	defer emitter.events.mutex.RUnlock()
+
+	count := 0
+	for _, listeners := range emitter.events.listeners {
+		count += len(listeners)
+	}
+	return count
 }

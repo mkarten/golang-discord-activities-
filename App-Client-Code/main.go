@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"syscall/js"
+	"time"
 )
 
 const (
@@ -61,8 +62,8 @@ func (sdk *DiscordSdk) String() string {
 
 }
 
-func NewDiscordSdk(clientId string, config Configuration) DiscordSdk {
-	tempSdk := DiscordSdk{}
+func NewDiscordSdk(clientId string, config Configuration) *DiscordSdk {
+	tempSdk := new(DiscordSdk)
 
 	// setup the eventBus
 	tempSdk.EventBus = eventEmitter.NewEventEmitter()
@@ -138,7 +139,18 @@ func (sdk *DiscordSdk) getRPCServerSource() (js.Value, string) {
 }
 
 func (sdk *DiscordSdk) addOnReadyListener() {
-	fmt.Println("Add on ready listener")
+	sdk.EventBus.Once(constants.READY, func(args ...interface{}) {
+		sdk.ready = true
+	}, nil)
+}
+
+// Ready is a blocking call that waits for the SDK to be ready and then executes the provided function
+// it is prefreable to call this function with a goroutine to prevent blocking the main thread
+func (sdk *DiscordSdk) Ready(fn func(...interface{}), context interface{}) {
+	for !sdk.ready {
+		time.Sleep(100 * time.Millisecond)
+	}
+	fn(context)
 }
 
 func (sdk *DiscordSdk) handshake() {
@@ -178,13 +190,13 @@ func (sdk *DiscordSdk) onMessage(event js.Value) {
 		// backwards compatibility for older applications
 		break
 	case CLOSE:
-		sdk.handleClose(data)
+		go sdk.handleClose(data)
 		break
 	case HANDSHAKE:
-		sdk.handleHandshake()
+		go sdk.handleHandshake()
 		break
 	case FRAME:
-		sdk.handleFrame(data)
+		go sdk.handleFrame(data)
 		break
 	default:
 		log.Fatal("Invalid opcode", opcode)
@@ -201,8 +213,10 @@ func (sdk *DiscordSdk) handleFrame(payload js.Value) {
 	fmt.Println("Handle Frame")
 	incomingPayload := parseIncomingPayload(payload)
 	// check if the payload cmd is a dispatch
-	if incomingPayload.Evt != constants.DISPATCH {
+	if incomingPayload.Cmd == constants.DISPATCH {
 		// dispatch the event and the data in the event bus
+		fmt.Println("Emitting", incomingPayload.Evt)
+		sdk.EventBus.Emit(incomingPayload.Evt, incomingPayload.Data)
 	}
 }
 
@@ -303,6 +317,10 @@ func main() {
 
 	// display a discord sdk information on the web page
 	//js.Global().Get("document").Call("write", fmt.Sprintf("<h1>%s</h1>", sdk.String()))
+
+	go sdk.Ready(func(args ...interface{}) {
+		fmt.Println("SDK is ready")
+	}, nil)
 
 	//prevent the program from exiting
 	select {}
